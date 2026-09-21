@@ -6,6 +6,8 @@ mjlab を用いた Asimov-1 の二足歩行ポリシー(速度追従)学習パ�
 - タスク ID: `Asimov-Velocity-Flat`(平地での速度指令追従)
 - 実装場所: `training/`(本ドキュメントと同じディレクトリ)
 
+![Asimov-1 のシミュレーション上での歩行](assets/asimov-1-walking-high.gif)
+
 ## 目次
 
 1. [シミュレーション環境の解析結果](#1-シミュレーション環境の解析結果)

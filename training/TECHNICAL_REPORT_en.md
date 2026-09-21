@@ -6,6 +6,8 @@ A record of building a bipedal walking (velocity-tracking) policy training pipel
 - Task ID: `Asimov-Velocity-Flat` (velocity-command tracking on flat ground)
 - Implementation: `training/` (the same directory as this document)
 
+![Asimov-1 walking in simulation](assets/asimov-1-walking-high.gif)
+
 ## Table of Contents
 
 1. [Analysis of the Simulation Environment](#1-analysis-of-the-simulation-environment)
