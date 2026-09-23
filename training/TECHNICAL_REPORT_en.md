@@ -15,6 +15,7 @@ A record of building a bipedal walking (velocity-tracking) policy training pipel
 3. [Using the Scripts](#3-using-the-scripts)
 4. [Known Limitations and Future Work](#4-known-limitations-and-future-work)
 5. [Stair-Climbing Task (Asimov-Velocity-Stairs)](#5-stair-climbing-task-asimov-velocity-stairs)
+6. [Redesigning Observations/Rewards with a climbing_mode Flag](#6-redesigning-observationsrewards-with-a-climbing_mode-flag)
 
 ---
 
@@ -571,3 +572,104 @@ uv run asimov-play-keyboard --task-id Asimov-Velocity-Stairs --step 0.02 --check
 ```
 
 `eval_policy.py`'s scenarios differ between the two tasks (the stairs set is `stand` / `climb 0.2` / `climb 0.4` / `back off -0.1` / `turn 0.3`, five low-speed scenarios matching the training command ranges).
+
+---
+
+## 6. Redesigning Observations/Rewards with a climbing_mode Flag
+
+SE1-SE4 (§5.6) tuned weights and parameters under one fixed reward and a 232-d observation applied uniformly across all terrain. The user pointed out that walking and stair-climbing are fundamentally different motions with no explicit mechanism to tell them apart, prompting a redesign of the observation/reward structure itself. Work date: 2026-09-23.
+
+### 6.1 What changed
+
+- **A `climbing_mode` flag derived from ground truth**: by the terrain generator's design, each environment stays on exactly one terrain patch (`flat` or a stairs tier) for its whole episode, so "is it climbing right now" is not a dynamic quantity that needs to be inferred from `height_scan` -- it is always available exactly from `env.scene.terrain.terrain_types`. This was added as a 1-d observation term for both actor and critic (`training/src/mjlab_asimov/tasks/mdp.py`, this project's first local mdp module).
+- **`height_scan` (187-d) removed from the actor**: privileged information with no real-hardware analog is no longer given to the actor, only to the critic (pushing the asymmetric actor-critic split further). Actor observation shrinks from 232-d to **46-d** (45 + climbing_mode); critic goes from 247 to **248-d**.
+- **Rewards switch by mode**: `pose` (`variable_posture_by_mode`), `foot_clearance`/`foot_swing_height`, and `air_time` now pick "walking mode = the flat task's proven values" or "climbing mode = the SE1/SE3-tuned values" based on `climbing_mode`. mjlab's `variable_posture` already switches std tables by speed regime (standing/walking/running); a 4th "climbing" slot was added following the same pattern.
+- **A manual toggle key (`C`) added to `asimov-play-keyboard`**: lets a human force-report "climbing" or "walking" to the policy regardless of the actual terrain, to observe the response in isolation.
+
+Because the actor's input dimensionality changes, **no checkpoint up to this point could be reused; training restarted from scratch.**
+
+### 6.2 Verification
+
+- Static tests (`training/tests/test_stairs_mdp.py`, 4 new): confirm `climbing_mode` matches the terrain type, and that the `pose` reward penalizes an identical joint offset less under climbing mode (looser std) than walking mode -- verified directly, without going through physics simulation.
+- Confirmed the actual built network has `Linear(in_features=46,...)` for the actor and `Linear(in_features=248,...)` for the critic.
+- A 300-iteration smoke run completed with no errors before committing to full training.
+
+### 6.3 First training result: gait finally differs by terrain
+
+4096 envs, 10000 iterations from scratch (about 2 h 54 min).
+
+**Per-terrain-type touchdown frequency [Hz]** (fixed vx=0.4 command, 800 envs x 8 s, `diagnose_gait.py`)
+
+| Stage | flat | easy_stairs | moderate_stairs | challenging_stairs | Training budget |
+|---|---|---|---|---|---|
+| Old: baseline | 0.87 (undifferentiated) | 0.87 | 0.86 | 0.87 | 11500 iter |
+| Old: SE1+SE3 (best) | 1.02-1.03 (undifferentiated) | 1.03 | 1.02 | 1.02 | 17500 iter |
+| **New: climbing_mode** | **1.233** | 1.073 | 1.082 | 1.080 | **10000 iter (fresh)** |
+
+Touchdown frequency on `flat` cells (1.233 Hz) is now clearly higher than on stairs cells -- **gait finally differs by terrain**. The stairs-side cadence (~1.08 Hz) matches or exceeds the old architecture's best result (17500 iterations of manual threshold tuning), reached here with no manual threshold tuning and fewer iterations. 0 falls across every terrain type (out of 800 envs). Curriculum reached a `challenging_stairs` level of 0.77 (vs. 0.045 for the old architecture at the same iteration count).
+
+### 6.4 Two issues found during keyboard playback
+
+Visual inspection with `asimov-play-keyboard` surfaced two observations:
+
+1. The robot barely moves forward until the command is pushed close to vx=0.4.
+2. Toggling mode with the `C` key produces little visible difference in the walking motion.
+
+#### Investigating #2: is the mode actually being read?
+
+`diagnose_gait.py`'s measurement changes both the terrain-type (mode bit) and the actual physical terrain at once, so it could not separate "the effect of the bit itself" from "the effect of actually different terrain." A controlled experiment was run instead: **hold the physical terrain fixed as flat, and vary only the observed `climbing_mode` value** (400 envs, fixed vx=0.4 command).
+
+| Condition (all physically flat) | Touchdown Hz | Achieved velocity |
+|---|---|---|
+| `climbing_mode` forced to 1 (fake climbing) | 1.181 | 0.303 |
+| `climbing_mode` = 0 (true walking) | 1.416 | 0.340 |
+
+With terrain held perfectly identical, the bit alone changed touchdown frequency by about 17%. **The policy does read and respond to `climbing_mode`.** The reason it was hard to see by eye is likely that a difference of this size is subtle without a side-by-side comparison.
+
+#### Root cause of #1: reward `std` was never rescaled for the narrower command range
+
+Restricting to `flat` cells only, achieved velocity was measured across a fine sweep of commanded vx from 0 to 0.4.
+
+| Commanded vx | 0.00 | 0.05 | 0.10 | 0.15 | 0.20 | 0.25 | 0.30 | 0.35 | 0.40 |
+|---|---|---|---|---|---|---|---|---|---|
+| Achieved (mean) | 0.003 | 0.003 | 0.006 | 0.019 | 0.094 | 0.203 | 0.255 | 0.301 | 0.339 |
+
+There is an almost total dead zone at or below 0.15, with response starting around 0.2. The cause was the `track_linear_velocity` reward's `std` parameter.
+
+- Flat task: `std=0.5` for a command range of +-0.8 (width 1.6)
+- Stairs task: `std` was left at the **same 0.5**, despite a command range of -0.1 to 0.4 (width 0.5, about 1/3.2 of the flat task's)
+
+`std` controls how forgiving the reward is of tracking error; with the same std over a 3.2x narrower range, standing still while 0.2-0.3 is commanded was already a small absolute error relative to std=0.5, so the reward stayed close to its maximum with little incentive to actually move. `track_angular_velocity` (std~0.707, turning range halved from +-0.6 to +-0.3) had the same issue.
+
+**Fix**: scaled `track_linear_velocity`'s `std` from 0.5 to 0.15 and `track_angular_velocity`'s from 0.707 to 0.35, proportional to how much narrower each command range is (`asimov_stairs_env_cfg.py`). Resumed from the existing checkpoint (10000 iter, §6.3) for 10000 more iterations to validate the fix (about 2 h 54 min).
+
+### 6.5 Validating the std fix
+
+**A note on how this reads in the training log**: right after the fix, `track_linear_velocity`/`track_angular_velocity`'s reward values and the aggregate `Mean reward` temporarily appeared to drop a lot (e.g. `Mean reward` 92.48 -> ~76). This is because tightening `std` structurally lowers `exp(-error^2/std^2)` for the same (or even better) tracking accuracy -- it is not a sign of worse performance. Indeed, over the 1000 iterations right after the change, the actual tracking error (`Metrics/twist/error_vel_xy`) decreased steadily from 0.261 to 0.237, and the reward value itself was already recovering, from 1.16 to 1.27. Comparing the raw `track_*` reward values before/after is not meaningful (the grading scale itself changed); tracking error and curriculum progress are the metrics that matter here.
+
+**Response to low-speed commands** (`flat` cells only, fine sweep of commanded vx)
+
+| Commanded vx | 0.00 | 0.05 | 0.10 | 0.15 | 0.20 | 0.25 | 0.30 | 0.35 | 0.40 |
+|---|---|---|---|---|---|---|---|---|---|
+| Before fix (achieved) | 0.003 | 0.003 | 0.006 | 0.019 | 0.094 | 0.203 | 0.255 | 0.301 | 0.339 |
+| **After fix (achieved)** | 0.000 | 0.017 | 0.072 | 0.128 | 0.183 | 0.235 | 0.286 | 0.336 | 0.390 |
+
+The dead zone is gone; the response is now roughly proportional across the whole 0.05-0.40 range.
+
+**Per-terrain-type touchdown frequency [Hz]** (fixed vx=0.4 command, `diagnose_gait.py`)
+
+| Stage | flat | easy_stairs | moderate_stairs | challenging_stairs | Training budget |
+|---|---|---|---|---|---|
+| Right after climbing_mode (§6.3) | 1.233 | 1.073 | 1.082 | 1.080 | 10000 iter |
+| **After the std fix** | **1.820** | **1.651** | **1.735** | **1.667** | **20000 iter** |
+| Reference: dedicated flat task | 1.7-1.8 | - | - | - | - |
+
+Gait on flat cells (1.82 Hz) now **essentially matches the dedicated flat task's own cadence (1.7-1.8 Hz)**. The stairs side also climbed to 1.65-1.74 Hz, well past the old architecture's best result (1.02-1.03 Hz after 17500 iterations). The gait difference by terrain (flat faster than stairs) is preserved.
+
+Curriculum reached level ~5 on every terrain type (`flat` 5.51, `easy_stairs` 5.32, `moderate_stairs` 5.17, `challenging_stairs` 5.01, overall mean 5.28) -- the best result so far. Fall rate is 9/207 (~4%) on `flat` (possibly a side effect of walking more aggressively at the higher cadence) and 1-3 out of ~200 envs on the stairs tiers.
+
+The best checkpoint at this point is `logs/rsl_rl/asimov1_stairs/2026-09-23_20-17-45_stairs_climbmode_v1_trackstd/model_19998.pt` (20000 cumulative iterations).
+
+### 6.6 Other changes
+
+- Checkpoint save interval changed from every 50 to every 1000 iterations for both tasks (`asimov_rl_cfg.py`, `asimov_stairs_rl_cfg.py`) -- saving every 50 iterations produced too many checkpoint files under `logs/`.

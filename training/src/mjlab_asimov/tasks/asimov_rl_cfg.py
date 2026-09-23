@@ -46,7 +46,7 @@ def asimov_ppo_runner_cfg() -> RslRlOnPolicyRunnerCfg:
     logger="wandb",
     wandb_project="asimov1-locomotion",
     wandb_tags=("asimov1", "velocity", "flat"),
-    save_interval=50,
+    save_interval=1000,
     num_steps_per_env=24,
     max_iterations=10_000,
   )

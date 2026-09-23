@@ -11,14 +11,18 @@ command must drive the robot *up and out* of a pit, not down off a platform).
 Design points:
 
 * Action space is unchanged from the flat task: the 12 leg joints only.
-* Actor observation grows from 45-d to 232-d (45 + a 17x11 `height_scan` heightmap
-  ahead of the pelvis) so the policy can see the stairs coming. This is a first-order
-  change to the policy's input; PPO hyperparameters carried over from the flat task
-  are an untested starting point, not a validated choice, for this input size.
-* `foot_clearance` / `foot_swing_height` target_height is raised to clear the tallest
-  riser (0.10 m) with margin. The `pose` reward's walking std is loosened further than
-  the flat task's (already loosened) values, since climbing structurally requires
-  larger hip/knee excursion every step, not just occasionally.
+* The raw 232-d `height_scan` heightmap is kept for the CRITIC only (privileged: it has
+  no real-hardware analog anyway, see TECHNICAL_REPORT.md). The actor instead gets a
+  1-d `climbing_mode` flag (ground truth from `env.scene.terrain.terrain_types`, which
+  is constant per env per episode -- no online classification needed), fed alongside
+  the twist command. Diagnosis (TECHNICAL_REPORT.md §5.5) found the first policy
+  learned one uniform, slow gait on every terrain type despite height_scan technically
+  containing terrain-discriminating information -- nothing told it to actually switch
+  behaviour. `climbing_mode` also selects mode-specific parameters for the `pose`,
+  `foot_clearance`/`foot_swing_height`, and `air_time` rewards (see
+  `mjlab_asimov.tasks.mdp`), instead of relying on the policy to discover the switch
+  is worthwhile under one fixed reward.
+* Actor observation is therefore 45 (flat-task-sized) + 1 (climbing_mode) = 46-d.
 * Velocity commands are slower and forward-biased (climbing is deliberate, not brisk),
   and `terrain_levels` curriculum is enabled (the terrain's own `curriculum=True`
   interpolates step height from 0.02 m up to 0.10 m across 10 rows per tier).
@@ -31,6 +35,7 @@ from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import (
@@ -53,6 +58,7 @@ from mjlab_asimov.robot.asimov_constants import (
   LEG_JOINT_EXPR,
   get_asimov_robot_cfg,
 )
+from mjlab_asimov.tasks import mdp as asimov_mdp
 from mjlab_asimov.tasks.asimov_stairs_terrain import ASIMOV_STAIRS_TERRAINS_CFG
 
 # The pelvis carries the IMU; the upper body is rigidly held on top of it.
@@ -139,10 +145,14 @@ def asimov_stairs_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   actor = cfg.observations["actor"]
   critic = cfg.observations["critic"]
 
-  # Unlike the flat task, height_scan (the terrain-ahead heightmap) is KEPT: it is
-  # how the policy sees the stairs coming. Actor obs grows from 45-d to 232-d
-  # (45 + 17x11 grid).
   actor.terms.pop("base_lin_vel")  # privileged: real robot can't measure this.
+  # Unlike height_scan (kept critic-only, see module docstring), climbing_mode is a
+  # single ground-truth bit the actor is allowed to use: it is a stand-in for what a
+  # real depth sensor / terrain classifier would eventually provide, not something the
+  # real robot could not in principle ever know.
+  actor.terms.pop("height_scan")
+  actor.terms["climbing_mode"] = ObservationTermCfg(func=asimov_mdp.climbing_mode)
+  critic.terms["climbing_mode"] = ObservationTermCfg(func=asimov_mdp.climbing_mode)
 
   actor.terms["base_ang_vel"].noise = Unoise(n_min=-0.01, n_max=0.01)
   actor.terms["projected_gravity"].noise = Unoise(n_min=-0.05, n_max=0.05)
@@ -218,18 +228,43 @@ def asimov_stairs_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   # Rewards.
   ##
 
-  # SE3 (training/TECHNICAL_REPORT.md-style tuning log): the first stairs policy
-  # (trained with hip_pitch/knee/ankle_pitch stds of 0.9/1.0/0.6) converged to one
-  # uniform, slow ~0.87 Hz gait on EVERY terrain type, including flat cells -- roughly
-  # 2x the joint excursion of the dedicated flat task even where the terrain didn't
-  # require it. SE1 (tightening the air_time reward's threshold_max from 0.5 to 0.35,
-  # since the old gait's ~0.5-0.6s swing duration sat right past that dead cutoff) only
-  # nudged cadence to ~0.98 Hz after 3000 more iterations -- not enough. Tightening the
-  # sagittal stds partway back toward the flat task's values (0.6/0.7/0.5) -- but still
-  # looser, since the hardest stair tier still needs more excursion than flat ground --
-  # is the next lever. Roll/yaw/ankle_roll stay tight -- lateral stability on a tread
-  # edge is if anything more safety-critical than on flat ground.
-  stairs_walking_std = {
+  # track_linear_velocity / track_angular_velocity: the template's std (0.5 / sqrt(0.5))
+  # is tuned for the flat task's much wider command ranges (lin_vel_x +-0.8, width 1.6;
+  # ang_vel_z +-0.6, width 1.2). This task's ranges are 3.2x / 2x narrower
+  # (lin_vel_x -0.1..0.4, width 0.5; ang_vel_z +-0.3, width 0.6), so the same std made
+  # the tracking reward nearly insensitive to whether the robot actually moved at the
+  # low end of the range: standing still at a commanded vx=0.2-0.3 was already a small
+  # absolute error relative to std=0.5, so `exp(-error^2/std^2)` stayed close to its
+  # maximum with almost no incentive to move. Measured effect: achieved velocity was
+  # ~0 for commands up to ~0.15, only starting to track meaningfully above ~0.2 (see
+  # training/TECHNICAL_REPORT.md and the keyboard-play feedback that prompted this).
+  # Scaling std down by the same ratio as the range narrowing restores a comparably
+  # sharp tracking incentive across the whole (narrower) command range.
+  cfg.rewards["track_linear_velocity"].params["std"] = 0.15
+  cfg.rewards["track_angular_velocity"].params["std"] = 0.35
+
+  # `climbing_mode`-aware reward design (see mjlab_asimov.tasks.mdp module docstring for
+  # the full rationale): the SE1-SE4 tuning history (training/TECHNICAL_REPORT.md §5.6)
+  # spent many experiments trying to find ONE set of pose/clearance/air-time parameters
+  # that works acceptably on both flat ground and stairs, under a single fixed reward
+  # applied everywhere -- with limited success (the policy applied one uniform,
+  # compromise gait regardless of terrain). Instead of continuing to tune a single
+  # shared config, `pose`/`foot_clearance`/`foot_swing_height`/`air_time` now pick
+  # between the flat task's proven walking values and the SE1/SE3-tuned climbing values
+  # based on `climbing_mode`, so the reward itself tells the policy which behaviour is
+  # wanted rather than leaving it to infer that from a raw heightmap.
+  #
+  # "Walking" values are exactly the dedicated flat task's tuned settings
+  # (asimov_velocity_env_cfg.py); "climbing" values are this task's own SE1/SE3 tuning.
+  flat_task_walking_std = {
+    r".*hip_pitch.*": 0.6,
+    r".*hip_roll.*": 0.15,
+    r".*hip_yaw.*": 0.15,
+    r".*knee.*": 0.7,
+    r".*ankle_pitch.*": 0.5,
+    r".*ankle_roll.*": 0.1,
+  }
+  stairs_climbing_std = {
     r".*hip_pitch.*": 0.75,
     r".*hip_roll.*": 0.15,
     r".*hip_yaw.*": 0.15,
@@ -237,41 +272,78 @@ def asimov_stairs_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
     r".*ankle_pitch.*": 0.55,
     r".*ankle_roll.*": 0.1,
   }
-  pose = cfg.rewards["pose"].params
-  pose["asset_cfg"] = _leg_joints()
-  pose["std_standing"] = {".*": 0.05}
-  pose["std_walking"] = stairs_walking_std
-  pose["std_running"] = stairs_walking_std
+  cfg.rewards["pose"] = RewardTermCfg(
+    func=asimov_mdp.variable_posture_by_mode,
+    weight=1.0,
+    params={
+      "asset_cfg": _leg_joints(),
+      "command_name": "twist",
+      "std_standing": {".*": 0.05},
+      "std_walking": flat_task_walking_std,
+      "std_running": flat_task_walking_std,
+      "std_climbing": stairs_climbing_std,
+      "walking_threshold": 0.05,
+      "running_threshold": 1.5,
+    },
+  )
 
   cfg.rewards["upright"].params["asset_cfg"].body_names = (BASE_BODY,)
   cfg.rewards["body_ang_vel"].params["asset_cfg"].body_names = (BASE_BODY,)
   cfg.rewards["dof_pos_limits"].params["asset_cfg"] = _leg_joints()
 
-  for reward_name in ("foot_clearance", "foot_slip"):
-    cfg.rewards[reward_name].params["asset_cfg"].site_names = FOOT_SITE_NAMES
+  cfg.rewards["foot_slip"].params["asset_cfg"].site_names = FOOT_SITE_NAMES
 
   cfg.rewards["body_ang_vel"].weight = -0.08
   cfg.rewards["angular_momentum"].weight = -0.03
 
-  # Raise the swing-height target above the tallest riser (0.10 m) with margin: a
-  # foot swinging toward a higher tread needs to clear its leading edge, not just
-  # reach the flat-ground target used by the walking task.
-  cfg.rewards["foot_clearance"].params["target_height"] = 0.12
-  cfg.rewards["foot_swing_height"].params["target_height"] = 0.12
-  cfg.rewards["foot_swing_height"].weight = -2.0
-  # threshold_max=0.5 (the mjlab default) turned out to be a dead zone: the first
-  # trained policy converged to a uniform, slow ~0.87 Hz gait (swing duration ~0.5-0.6s)
-  # on EVERY terrain type, including flat cells where nothing about the terrain forces
-  # it. That swing duration sits right at/over the reward's upper cutoff, so `air_time`
-  # measured exactly 0 even restricted to flat-terrain envs -- no gradient was pushing
-  # cadence up. Tightening threshold_max to ~0.35s (close to the dedicated flat task's
-  # natural ~0.3s swing duration at a similar speed) puts the current gait outside the
-  # rewarded band on the correctable side, restoring a live signal toward shorter
-  # swings / higher cadence. Weight raised alongside it to strengthen the pull once back
-  # inside the window. See training/scripts/diagnose_gait.py for the per-terrain-type
-  # diagnostic that found this.
-  cfg.rewards["air_time"].params["threshold_max"] = 0.35
-  cfg.rewards["air_time"].weight = 0.8
+  # foot_clearance / foot_swing_height: target_height 0.1 m (flat task's proven value)
+  # when walking, 0.12 m (SE1/SE3's value: the tallest riser, 0.10 m, plus margin) when
+  # climbing -- a foot swinging toward a higher tread needs to clear its leading edge,
+  # not just reach the flat-ground target.
+  cfg.rewards["foot_clearance"] = RewardTermCfg(
+    func=asimov_mdp.feet_clearance_by_mode,
+    weight=-2.0,
+    params={
+      "target_height_walking": 0.1,
+      "target_height_climbing": 0.12,
+      "height_sensor_name": "foot_height_scan",
+      "command_name": "twist",
+      "command_threshold": 0.05,
+      "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES),
+    },
+  )
+  cfg.rewards["foot_swing_height"] = RewardTermCfg(
+    func=asimov_mdp.feet_swing_height_by_mode,
+    weight=-2.0,
+    params={
+      "sensor_name": "feet_ground_contact",
+      "height_sensor_name": "foot_height_scan",
+      "target_height_walking": 0.1,
+      "target_height_climbing": 0.12,
+      "command_name": "twist",
+      "command_threshold": 0.05,
+    },
+  )
+  # air_time: the flat task's natural ~0.3s swing duration falls inside the mjlab
+  # default window (threshold_max=0.5, weight=0.5); the first stairs policy's ~0.5-0.6s
+  # swing duration sat right past that cutoff -- a dead zone with no reward, hence no
+  # gradient pushing cadence up (see training/scripts/diagnose_gait.py and
+  # TECHNICAL_REPORT.md §5.5). SE1's fix (threshold_max=0.35, weight=0.8) is now applied
+  # only when climbing_mode=1; walking_mode keeps the flat task's untouched defaults.
+  cfg.rewards["air_time"] = RewardTermCfg(
+    func=asimov_mdp.feet_air_time_by_mode,
+    weight=1.0,  # per-env weight is applied inside the function; see its docstring.
+    params={
+      "sensor_name": "feet_ground_contact",
+      "threshold_min": 0.05,
+      "threshold_max_walking": 0.5,
+      "threshold_max_climbing": 0.35,
+      "weight_walking": 0.5,
+      "weight_climbing": 0.8,
+      "command_name": "twist",
+      "command_threshold": 0.5,
+    },
+  )
   cfg.rewards["action_rate_l2"].weight = -0.03
 
   cfg.rewards["torques"] = RewardTermCfg(func=mdp.joint_torques_l2, weight=-5e-5)

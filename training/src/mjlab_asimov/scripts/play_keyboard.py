@@ -6,6 +6,8 @@ Type in the TERMINAL that launched this script (not in the viewer window):
   Left / Right   turn left / right       (wz +/- step)
   A / E          strafe left / right     (vy +/- step)
   Space          zero every command
+  C              toggle climbing_mode (stairs task only; overrides the terrain's own
+                 ground-truth flag, for exploring how the policy responds to each mode)
 
 Keys are read from the terminal because the MuJoCo viewer window binds all 26 letters
 (and Space, Left/Right, ...) to display toggles; keeping the keys out of the window means
@@ -54,6 +56,7 @@ _KEY_TO_AXIS = {
   "right": (2, -1.0),
 }
 STOP_KEY = "space"
+MODE_TOGGLE_KEY = "c"
 
 HELP = """\
 Keyboard twist control -- type in THIS terminal (the viewer window is display only):
@@ -62,6 +65,8 @@ Keyboard twist control -- type in THIS terminal (the viewer window is display on
   A / E         strafe left / right
   Space         zero every command
   Ctrl-C        quit"""
+
+HELP_CLIMBING_MODE = "  C             toggle climbing_mode (currently walking/0)"
 
 _ARROW_FINALS = {ord("A"): "up", ord("B"): "down", ord("C"): "right", ord("D"): "left"}
 
@@ -94,7 +99,7 @@ def parse_keys(data: bytes) -> list[str]:
       continue
     if b == 0x20:
       keys.append(STOP_KEY)
-    elif b < 0x80 and chr(b).lower() in ("a", "e"):
+    elif b < 0x80 and chr(b).lower() in ("a", "e", MODE_TOGGLE_KEY):
       keys.append(chr(b).lower())
     i += 1
   return keys
@@ -142,17 +147,58 @@ class KeyboardTwist:
       self._on_change(new)
 
 
+class ClimbingModeToggle:
+  """Lets a human override the stairs task's ground-truth ``climbing_mode`` flag.
+
+  ``climbing_mode`` (see mjlab_asimov.tasks.mdp) is normally derived from the terrain
+  patch each env actually spawned on. This toggle overwrites that per-env ground truth
+  directly (``env.scene.terrain.terrain_types``) so a human can ask "how does the
+  policy behave if told it's climbing / walking", independent of the actual terrain
+  underfoot. No-op for tasks without generator terrain (e.g. the flat task).
+  """
+
+  def __init__(self, on_change: Callable[[bool], None] | None = None):
+    self._mode = False
+    self._lock = threading.Lock()
+    self._on_change = on_change
+
+  def snapshot(self) -> bool:
+    with self._lock:
+      return self._mode
+
+  def on_key(self, key: str) -> None:
+    if key != MODE_TOGGLE_KEY:
+      return
+    with self._lock:
+      self._mode = not self._mode
+      new = self._mode
+    if self._on_change is not None:
+      self._on_change(new)
+
+
 class KeyboardPolicy:
   """Wraps a policy and writes the keyboard command into the env before each call."""
 
-  def __init__(self, policy, command_term, twist: KeyboardTwist):
+  def __init__(
+    self,
+    policy,
+    command_term,
+    twist: KeyboardTwist,
+    mode_toggle: ClimbingModeToggle | None = None,
+    terrain=None,
+  ):
     self._policy = policy
     self._term = command_term
     self._twist = twist
+    self._mode_toggle = mode_toggle
+    self._terrain = terrain
 
   def __call__(self, obs):
     cmd = self._term.vel_command_b
     cmd[:] = torch.tensor(self._twist.snapshot(), device=cmd.device, dtype=cmd.dtype)
+    if self._mode_toggle is not None and self._terrain is not None:
+      # 1 = any stairs tier (climbing_mode only checks "!= flat index 0").
+      self._terrain.terrain_types[:] = 1 if self._mode_toggle.snapshot() else 0
     return self._policy(obs)
 
   def reset(self, *args, **kwargs):
@@ -162,14 +208,14 @@ class KeyboardPolicy:
 
 
 class TerminalKeys:
-  """Feeds key presses typed in the terminal to a KeyboardTwist (context manager).
+  """Feeds key presses typed in the terminal to one or more ``on_key(str)`` listeners.
 
   Puts the terminal in cbreak mode (no line buffering, no echo, Ctrl-C still works) and
   reads it on a daemon thread; the original terminal settings are always restored.
   """
 
-  def __init__(self, twist: KeyboardTwist, fd: int | None = None):
-    self._twist = twist
+  def __init__(self, *listeners, fd: int | None = None):
+    self._listeners = [listener for listener in listeners if listener is not None]
     self._fd = sys.stdin.fileno() if fd is None else fd
     self._saved = None
     self._stop = threading.Event()
@@ -200,7 +246,8 @@ class TerminalKeys:
       if not data:
         break
       for key in parse_keys(data):
-        self._twist.on_key(key)
+        for listener in self._listeners:
+          listener.on_key(key)
 
   def __exit__(self, *exc) -> None:
     self._stop.set()
@@ -267,8 +314,22 @@ def main() -> None:
   print(f"limits: vx +-{limits[0]}, vy +-{limits[1]}, wz +-{limits[2]}; step {args.step}")
   _print_command(twist.snapshot())
 
-  viewer = NativeMujocoViewer(env, KeyboardPolicy(policy, command_term, twist))
-  with TerminalKeys(twist):
+  terrain = env.unwrapped.scene.terrain
+  has_climbing_mode = terrain is not None and terrain.terrain_types is not None
+  mode_toggle = None
+  if has_climbing_mode:
+
+    def _print_mode(mode: bool) -> None:
+      print(f"climbing_mode={int(mode)}", flush=True)
+
+    mode_toggle = ClimbingModeToggle(on_change=_print_mode)
+    print(HELP_CLIMBING_MODE)
+
+  keyboard_policy = KeyboardPolicy(
+    policy, command_term, twist, mode_toggle, terrain if has_climbing_mode else None
+  )
+  viewer = NativeMujocoViewer(env, keyboard_policy)
+  with TerminalKeys(twist, mode_toggle):
     viewer.run()
   env.close()
 
