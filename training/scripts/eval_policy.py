@@ -4,8 +4,15 @@ For each fixed velocity command it rolls out many envs (no noise, no pushes) and
 the achieved body-frame velocity, falls and the stepping pattern (touchdowns per foot per
 second, fraction of time both feet are airborne, left/right alternation).
 
+Works for both registered tasks (``--task``): the flat velocity-tracking task and the
+stair-climbing task. The command scenarios differ because the two tasks were trained
+with different velocity-command ranges (stairs is slower and forward-biased -- see
+``asimov_stairs_env_cfg.py``); each task gets its own scenario set below.
+
 Usage:
   uv run python training/scripts/eval_policy.py --checkpoint logs/rsl_rl/.../model_1499.pt
+  uv run python training/scripts/eval_policy.py --task Asimov-Velocity-Stairs \\
+      --checkpoint logs/rsl_rl/asimov1_stairs/.../model_29999.pt
 """
 
 import argparse
@@ -19,24 +26,39 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.runner import MjlabOnPolicyRunner
 from mjlab.tasks.registry import load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.tasks.velocity.mdp import UniformVelocityCommandCfg
+from mjlab_asimov.tasks import TASK_ID, TASK_ID_STAIRS
 
-TASK_ID = "Asimov-Velocity-Flat"
-
-# name -> (vx, vy, wz) body-frame command
+# name -> (vx, vy, wz) body-frame command, per task (each task was trained with its own
+# --env.commands.twist.ranges, see the respective *_env_cfg.py).
 SCENARIOS = {
-  "stand": (0.0, 0.0, 0.0),
-  "forward 0.4": (0.4, 0.0, 0.0),
-  "forward 0.8": (0.8, 0.0, 0.0),
-  "backward -0.4": (-0.4, 0.0, 0.0),
-  "lateral 0.4": (0.0, 0.4, 0.0),
-  "turn 0.5": (0.0, 0.0, 0.5),
+  TASK_ID: {
+    "stand": (0.0, 0.0, 0.0),
+    "forward 0.4": (0.4, 0.0, 0.0),
+    "forward 0.8": (0.8, 0.0, 0.0),
+    "backward -0.4": (-0.4, 0.0, 0.0),
+    "lateral 0.4": (0.0, 0.4, 0.0),
+    "turn 0.5": (0.0, 0.0, 0.5),
+  },
+  TASK_ID_STAIRS: {
+    # Slow, forward-biased: stairs.ranges.lin_vel_x=(-0.1,0.4), lin_vel_y=(-0.1,0.1),
+    # ang_vel_z=(-0.3,0.3). Lateral commands are omitted: the ascent-only terrain is
+    # symmetric about a straight climb, so a sideways command mostly walks diagonally
+    # across treads rather than exercising a meaningfully different skill.
+    "stand": (0.0, 0.0, 0.0),
+    "climb 0.2": (0.2, 0.0, 0.0),
+    "climb 0.4": (0.4, 0.0, 0.0),
+    "back off -0.1": (-0.1, 0.0, 0.0),
+    "turn 0.3": (0.2, 0.0, 0.3),
+  },
 }
 
 
-def run(checkpoint: str, cmd: tuple[float, float, float], num_envs: int, steps: int):
+def run(
+  task_id: str, checkpoint: str, cmd: tuple[float, float, float], num_envs: int, steps: int
+):
   device = "cuda:0"
-  env_cfg = load_env_cfg(TASK_ID, play=True)
-  agent_cfg = load_rl_cfg(TASK_ID)
+  env_cfg = load_env_cfg(task_id, play=True)
+  agent_cfg = load_rl_cfg(task_id)
   env_cfg.scene.num_envs = num_envs
   env_cfg.episode_length_s = 1e6
 
@@ -55,7 +77,7 @@ def run(checkpoint: str, cmd: tuple[float, float, float], num_envs: int, steps: 
   env = RslRlVecEnvWrapper(
     ManagerBasedRlEnv(cfg=env_cfg, device=device), clip_actions=agent_cfg.clip_actions
   )
-  runner_cls = load_runner_cls(TASK_ID) or MjlabOnPolicyRunner
+  runner_cls = load_runner_cls(task_id) or MjlabOnPolicyRunner
   runner = runner_cls(env, asdict(agent_cfg), device=device)
   runner.load(checkpoint, load_cfg={"actor": True}, strict=True, map_location=device)
   policy = runner.get_inference_policy(device=device)
@@ -114,14 +136,16 @@ def run(checkpoint: str, cmd: tuple[float, float, float], num_envs: int, steps: 
 def main() -> None:
   parser = argparse.ArgumentParser()
   parser.add_argument("--checkpoint", required=True)
+  parser.add_argument("--task", default=TASK_ID, choices=sorted(SCENARIOS))
   parser.add_argument("--num-envs", type=int, default=64)
   parser.add_argument("--seconds", type=float, default=8.0)
   args = parser.parse_args()
 
   steps = int(args.seconds / 0.02)
+  print(f"task: {args.task}")
   print(f"{'command (vx,vy,wz)':28s} {'achieved (vx,vy,wz)':26s} falls  step Hz L/R  both-air both-ground  swing-peak(cm)")
-  for name, cmd in SCENARIOS.items():
-    r = run(args.checkpoint, cmd, args.num_envs, steps)
+  for name, cmd in SCENARIOS[args.task].items():
+    r = run(args.task, args.checkpoint, cmd, args.num_envs, steps)
     v = r["v"]
     print(
       f"{name:14s}{str(cmd):14s} ({v[0]:+.2f},{v[1]:+.2f},{v[2]:+.2f})".ljust(56)

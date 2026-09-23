@@ -3,7 +3,7 @@
 mjlab を用いた Asimov-1 の二足歩行ポリシー(速度追従)学習パイプラインの構築記録。作業日: 2026-09-21〜22。
 
 - 対象: `sim-model/xmls/asimov_1.xml`(MuJoCo MJCF)
-- タスク ID: `Asimov-Velocity-Flat`(平地での速度指令追従)
+- タスク ID: `Asimov-Velocity-Flat`(平地での速度指令追従)、`Asimov-Velocity-Stairs`(階段登坂、§5)
 - 実装場所: `training/`(本ドキュメントと同じディレクトリ)
 
 ![Asimov-1 のシミュレーション上での歩行](assets/asimov-1-walking-high.gif)
@@ -14,6 +14,7 @@ mjlab を用いた Asimov-1 の二足歩行ポリシー(速度追従)学習パ�
 2. [歩行ポリシーの学習方針と実験結果](#2-歩行ポリシーの学習方針と実験結果)
 3. [作成したスクリプトの利用方法](#3-作成したスクリプトの利用方法)
 4. [既知の制限と今後の課題](#4-既知の制限と今後の課題)
+5. [階段登坂タスク(Asimov-Velocity-Stairs)](#5-階段登坂タスクasimov-velocity-stairs)
 
 ---
 
@@ -277,6 +278,8 @@ uv run wandb login
 
 学習ログは既定で wandb に送られるため、`wandb login` は学習を始める前に済ませておく。wandb を使わない場合は、学習時に `--agent.logger tensorboard` を指定すれば `wandb login` は不要(§3.5)。
 
+本節はタスク共通の使い方(平地タスク `Asimov-Velocity-Flat` を例に説明)。階段タスク `Asimov-Velocity-Stairs` 固有のコマンド・スクリプトは §5.7 にまとめた。
+
 ### 3.1 ファイル構成
 
 ```
@@ -285,15 +288,19 @@ training/
 ├── TECHNICAL_REPORT_en.md                    英語版
 ├── src/mjlab_asimov/
 │   ├── robot/asimov_constants.py             ロボット定義(アクチュエータ、初期姿勢、衝突)
-│   ├── tasks/__init__.py                     タスク登録(Asimov-Velocity-Flat)
-│   ├── tasks/asimov_velocity_env_cfg.py      環境設定(観測・報酬・DR・コマンド)
-│   ├── tasks/asimov_rl_cfg.py                PPO / ロガー設定
+│   ├── tasks/__init__.py                     タスク登録(Flat と Stairs の両方)
+│   ├── tasks/asimov_velocity_env_cfg.py      平地タスクの環境設定(観測・報酬・DR・コマンド)
+│   ├── tasks/asimov_rl_cfg.py                平地タスクの PPO / ロガー設定
+│   ├── tasks/asimov_stairs_terrain.py        階段地形(登り専用、§5.1)
+│   ├── tasks/asimov_stairs_env_cfg.py        階段タスクの環境設定(§5.2)
+│   ├── tasks/asimov_stairs_rl_cfg.py         階段タスクの PPO / ロガー設定
 │   └── scripts/
 │       ├── train_cli.py                      asimov-train / asimov-play の実体
 │       └── play_keyboard.py                  asimov-play-keyboard の実体
 ├── scripts/
 │   ├── check_standing.py                     初期姿勢・モデル構築の確認(CPU)
-│   └── eval_policy.py                        固定指令での数値評価
+│   ├── eval_policy.py                        固定指令での数値評価(タスク共通)
+│   └── diagnose_gait.py                      階段タスク用、地形タイプ別の歩容診断(§5.4)
 └── tests/                                    静的テスト(GPU 不要、23 件)
 ```
 
@@ -401,3 +408,166 @@ uv run pytest training/tests -q
 - 目標高さ(現在 0.1 m)の調整。前進 0.8 m/s では 10.8 cm と目標を超えている。
 - 複数シードでの再現性確認。
 - 首の関節追加や RSU 機構のモデル化(MJCF の拡張)、デプロイ(ONNX エクスポートは学習時に自動出力される)。
+
+---
+
+## 5. 階段登坂タスク(Asimov-Velocity-Stairs)
+
+平地タスクの学習パイプラインを土台に、環境へ階段を設置し、階段を登るモーションを学習させた記録。作業日: 2026-09-22。まずは「登る」動作専用のタスクとして構築し、下りは将来カリキュラム的に追加する方針とした。
+
+### 5.1 地形設計
+
+mjlab 1.6.0 の地形生成には、階段タスクの設計に直結する重要な性質がある。
+
+- `mjlab.terrains.primitive_terrains.BoxPyramidStairsTerrainCfg`(通常の `pyramid_stairs` プリセット)は、原点(各環境のスポーン地点)が**階段の頂上の踊り場**(`origin_z = (num_steps+1) × step_height`)にあり、外側に進むほど下る形状。前進コマンドで学習させると「下り」の練習になってしまう。
+- `BoxInvertedPyramidStairsTerrainCfg`(`pyramid_stairs_inv` プリセット)はこの逆で、原点が**すり鉢状の底**(`origin_z = -(num_steps+1) × step_height`)にあり、外側に進むほど登る形状。前進コマンドで自然に「登り」を学習できる。両方とも実際にソースコードの `origin` 計算式を読んで確認した。
+- mjlab には階段専用の地形プリセット `STAIRS_TERRAINS_CFG`(`mjlab/terrains/config.py`)が既に定義されているが、**`pyramid_stairs`(下り形状)のみ**を使っており `pyramid_stairs_inv` は含まれていない。またこの `STAIRS_TERRAINS_CFG` はどの同梱タスクからも使われていない(未検証のコード)。「登る」専用にするため、これは使わず `pyramid_stairs_inv` で組んだ地形設定を新規に定義した(`training/src/mjlab_asimov/tasks/asimov_stairs_terrain.py`)。
+
+```python
+ASIMOV_STAIRS_TERRAINS_CFG = TerrainGeneratorCfg(
+  size=(8.0, 8.0), border_width=20.0, num_rows=10, curriculum=True,
+  sub_terrains={
+    "flat": flat(proportion=0.25),
+    "easy_stairs": pyramid_stairs_inv(proportion=0.35, step_height_range=(0.02, 0.05), step_width=0.40),
+    "moderate_stairs": pyramid_stairs_inv(proportion=0.25, step_height_range=(0.05, 0.08), step_width=0.35, platform_width=2.5, border_width=0.8),
+    "challenging_stairs": pyramid_stairs_inv(proportion=0.15, step_height_range=(0.08, 0.10), step_width=0.30, platform_width=2.0, border_width=0.5),
+  },
+  add_lights=True,
+)
+```
+
+段差の高さ範囲(0.02〜0.10 m)は mjlab の `STAIRS_TERRAINS_CFG` の既定値をそのまま採用した。Asimov-1 は平地歩行でも `pose` 報酬が原因で遊脚高さが上がりにくい実績があり(§2.6)、0.10 m は「簡単すぎる設定」ではなく現実的な目標値と判断したため。`flat` を混ぜているのは、地形スキャン観測(§5.2)に慣れる猶予と、カリキュラムの最も易しい行として機能させるため。将来「下り」を追加する場合は、同じ設定に `pyramid_stairs`(非 inverted)の列を追加すればよい。
+
+### 5.2 環境設定(`training/src/mjlab_asimov/tasks/asimov_stairs_env_cfg.py`)
+
+平地タスクは `terrain_type="plane"` にして地形スキャン関連を削っているが、階段タスクは mjlab テンプレートの既定(`terrain_type="generator"`)を維持し、以下を復元・変更した。
+
+| 項目 | 平地タスク | 階段タスク |
+|---|---|---|
+| 地形 | 平地(`plane`) | `ASIMOV_STAIRS_TERRAINS_CFG`(生成地形) |
+| `max_init_terrain_level` | (該当なし) | `0`(最も易しい行から開始) |
+| `terrain_scan` センサー(地形スキャン) | 削除 | 復元(`frame.name="pelvis_link"`) |
+| `height_scan` 観測 | 削除 | 復元(actor・critic 両方) |
+| `out_of_terrain_bounds` 終了条件 | 削除(平地では no-op) | 復元 |
+| `terrain_levels` カリキュラム | 削除 | 復元(`command_vel` は平地同様に削除) |
+| コマンド範囲 | vx ±0.8, vy ±0.6, wz ±0.6 | **vx -0.1〜0.4, vy ±0.1, wz ±0.3**(慎重な登坂を想定) |
+| `rel_forward_envs` | 0.2 | 0.6(直進経験を増やす) |
+| `foot_clearance`/`foot_swing_height` の `target_height` | 0.1 m | **0.12 m**(最大段差 0.10 m を余裕を持って越えるため) |
+| シミュレーションバッファ | `njmax=300`(縮小) | `ccd_iterations=500`, `contact_sensor_maxmatch=500`, `nconmax=70`(地形の接触ジオム増加に対応、G1 の rough 地形設定を流用) |
+
+**観測次元の増加**: `height_scan`(骨盤前方 1.6×1.0 m、解像度 0.1 m の 17×11 グリッド、187 次元)を復元したことで、actor の観測は平地タスクの 45 次元から **232 次元**(45 + 187)に増える。critic はさらに特権情報(足の高さ・滞空時間・接地・接地力)を加えた 247 次元。PPO のネットワーク・ハイパーパラメータは平地タスクの値を出発点としたが、この入力サイズでは未検証という前提で扱った。
+
+**`pose` 報酬の std(初期値)**: 平地タスクの std(hip pitch 0.6, knee 0.7, ankle pitch 0.5)は階段の登坂には不十分と想定し、さらに緩めた値を初期設定とした(hip pitch 0.9, knee 1.0, ankle pitch 0.6。hip roll/yaw、ankle roll は 0.15/0.15/0.1 のまま)。この値は後述の SE3(§5.6)で見直すことになる。
+
+### 5.3 実装前後の検証
+
+コードを書く前・書いた後の両方で、机上の想定に頼らず実測で確認した。
+
+1. **地形の目視確認**: オフスクリーンレンダリングで、難易度が上がるほどピットが深くなる同心正方形のすり鉢状階段が生成されることを確認(`terrain_origins` の z 座標: `flat` = 0、`easy_stairs` ≈ -0.08〜-0.20 m、`moderate_stairs` ≈ -0.30〜-0.48 m、`challenging_stairs` ≈ -0.72〜-0.90 m、難易度=行 0〜9 に対応)。
+2. **非平地でのスポーン確認**: mjlab のリセット処理(`reset_root_state_uniform`)は `default_root_state[:, 0:3] += env.scene.env_origins[env_ids]` という実装で、ホーム姿勢の位置(`pos=(0,0,0.62)`)に各地形パッチの原点(ピットの底など)を単純加算する。実際に環境を構築して確認したところ、学習用設定ではロボットは全環境が最も易しい行(level=0)にスポーンし、地形原点からのペルビス高さの差は常に約 0.62〜0.66(ホーム姿勢どおり)だった。
+3. **短時間の試験学習**(1024 環境、300 イテレーション): エラー・NaN・バッファ溢れの警告なく完了。転倒率はまだ高く、カリキュラムも進んでいなかったが、300 イテレーションでは想定どおり。
+
+### 5.4 学習の経過
+
+**タスク登録**: `Asimov-Velocity-Stairs` を平地タスクと並べて登録(`tasks/__init__.py`)。PPO 設定は平地タスクを流用せず分岐した(`asimov_stairs_rl_cfg.py`、`experiment_name="asimov1_stairs"`, `wandb_tags=("asimov1","velocity","stairs")`)。
+
+| 実行 | 内容 | 所要時間 | 通算イテレーション |
+|---|---|---|---|
+| 本番 1 回目 | 4096 環境、1500 イテレーション(新規) | 26 分 52 秒 | 1500 |
+| 本番 2 回目 | 同、10000 イテレーション追加(`--agent.resume`) | 2 時間 57 分 | 11500 |
+
+**カリキュラム到達レベル**(`terrain_levels`、10 段階中)
+
+| 地形 | 1500 イテレーション | 11500 イテレーション |
+|---|---|---|
+| flat | 2.39 | 4.71 |
+| easy_stairs | 0.53 | 3.76 |
+| moderate_stairs | 0.01 | 1.96 |
+| challenging_stairs | 0.00 | 0.09 |
+| 全体平均 | 0.79 | 3.00 |
+
+**`eval_policy.py --task Asimov-Velocity-Stairs` の結果**(地形タイプを区別しないタスク全体平均。転倒はいずれも 0 / 64)
+
+| コマンド | 指令 (vx,vy,wz) | 実測(1500 iter) | 実測(11500 iter) |
+|---|---|---|---|
+| 停止 | 0, 0, 0 | 0.00 | 0.00 |
+| 登り 0.2 | 0.2, 0, 0 | 0.05(歩数 0.17 Hz) | 0.09(歩数 0.31 Hz) |
+| 登り 0.4 | 0.4, 0, 0 | 0.29(遊脚 8.0 cm) | 0.35(遊脚 10.0 cm) |
+| 後退 -0.1 | -0.1, 0, 0 | 0.00 | 0.00 |
+| 旋回(前進 0.2 + 旋回 0.3) | 0.2, 0, 0.3 | 0.12 / 0.22 | 0.11 / 0.23 |
+
+11500 イテレーション時点で、転倒 0 のまま指令 0.4 での追従率が 72%→87%、遊脚高さも 8.0→10.0 cm に向上。カリキュラムも `moderate_stairs` まで進んだ。一方、指令 0.2 や後退 -0.1 のような小さい・負の指令にはほとんど反応しなかった(§5.6 のコマンド分布の分析で原因が判明)。
+
+### 5.5 歩容がぎこちない問題の診断
+
+`asimov-play-keyboard` で目視確認したところ、「前進コマンドを最大にしても、ゆっくり一歩ずつ歩く」ぎこちない歩容だった。平地専用タスクの歩容(同程度の速度で 1.7〜1.8 Hz)と明らかに違う。原因を詳しく調査した。
+
+1. **歩容は全地形タイプで一様**: 固定指令 vx=0.4 で計測すると、`flat`・`easy_stairs`・`moderate_stairs`・`challenging_stairs` のどれでも実測速度(0.34 前後)・接地頻度(0.94 Hz 前後)・ストライド長(0.36 m 前後)がほぼ同一だった。方策は「平地でも階段でも同じ、慎重で遅い 1 つの歩容」を学習しており、地形の難易度に応じて歩き方を変えていない。
+2. **関節可動域**: `flat` 地形セルでの股関節 pitch の振れ幅は約 0.50〜0.57 rad(平地専用方策の約 0.28 rad の約 2 倍)、膝は約 0.87〜1.0 rad。トルク使用率も一部で高く、右足首 pitch は p95 で定格の 81.4%、股関節 roll は 56〜61%(平地専用方策は「どこも余裕あり」だった)。大きな動きを、より長い時間かけて行っている。
+3. **報酬内訳**(`flat` 地形セルのみ、指令 0.4 での実測): `track_linear_velocity`(+1.89)・`track_angular_velocity`(+1.96)・`upright`(+0.995)・`pose`(+0.946)がほぼ満点近くで、歩容の質にほとんど左右されない。一方 `air_time` は**ちょうど 0**、`foot_clearance`(-0.08)・`foot_swing_height`(-0.005)も 2 桁小さい。**歩容の速さ・ケイデンスを直接後押しする生きた報酬信号が実質存在しなかった**。
+4. **`air_time` 報酬が死んでいた理由**: `feet_air_time` 報酬は各足の遊脚時間が `threshold_min=0.05〜threshold_max=0.5` 秒の範囲にあるときだけ加点する(mjlab の既定値のまま変更していなかった)。今の歩容の接地頻度(約 0.94 Hz)から逆算すると遊脚時間はおよそ 0.5〜0.6 秒で、**ちょうど上限 0.5 秒を超えていた**。閾値を超えると加点 0 になり、しきい値判定のため「超えるほど悪い」という勾配も出ない。平地専用タスクは同じ閾値のままだったが、遊脚時間が 0.3 秒前後(ケイデンス約 1.7 Hz)に収まっていたため機能していた。
+5. **`height_scan` 観測は正常**: NaN や飽和はなく、地形の難易度に応じて分布にも差があった(方策側がまだそれを歩容の切り替えに使えていないだけ)。
+6. **速度コマンドの分布の偏り**: `UniformVelocityCommandCfg` の前進フラグ処理は、mjlab 側にハードコードされた `vel_command_b[fwd_ids,0].abs().clamp(min=0.3)` という実装により、`lin_vel_x=(-0.1,0.4)` という設定でも前進フラグが立った環境の約 80% が**ちょうど 0.3 に張り付き**、0.39 以上に達するのはわずか約 2%。全学習環境平均の指令速度は 0.234 に過ぎなかった。
+
+### 5.6 報酬設計の見直し実験
+
+診断結果をもとに、平地タスクの E1〜E4 と同じ「1 回に 1 つずつ変更」方式で試した。各実験は前の実験のチェックポイントから `--agent.resume` で再開し、3000 イテレーション(約 53 分)追加学習した。効果測定には地形タイプ別に集計する専用スクリプト(`training/scripts/diagnose_gait.py`)を新設した(既存の `eval_policy.py` は地形タイプを区別しない全体平均のため、平地での改善と難所での悪化が相殺されて見えなくなる)。
+
+| 実験 | 変更内容 |
+|---|---|
+| SE1 | `air_time` の `threshold_max` を 0.5 → 0.35 秒、重みを 0.5 → 0.8 |
+| SE3 | `pose` の std を hip pitch 0.9→0.75、knee 1.0→0.85、ankle pitch 0.6→0.55(roll/yaw/ankle roll は変更なし) |
+
+**地形タイプ別の接地頻度 [Hz]**(固定指令 vx=0.4、800 環境 × 8 秒)
+
+| 段階 | flat | easy_stairs | moderate_stairs | challenging_stairs |
+|---|---|---|---|---|
+| ベースライン(11500 iter) | 0.87 | 0.87 | 0.86 | 0.87 |
+| SE1 適用後(14500 iter) | 0.98 | 0.98 | 0.98 | 0.98 |
+| SE1+SE3 適用後(17500 iter) | 1.03 | 1.03 | 1.02 | 1.02 |
+
+両方の変更とも狙った方向(ケイデンスを上げる)に効いたが、伸びは実験を重ねるごとに小さくなった(+0.11 → +0.04)。平地専用タスクの 1.7〜1.8 Hz にはまだ遠い。一方でカリキュラム進捗・転倒率は SE1・SE3 とも悪化させなかった(`moderate_stairs` 到達レベル 1.96 → 2.82 → 3.01、`challenging_stairs` 0.09 → 0.30 → 0.23、`fell_over` 0.43 → 0.13 → 0.17)。
+
+**なぜ伸びが小さいのか**: SE1・SE3 とも、収束済み(`Mean action std` 約 0.59〜0.60 まで低下)の方策を `--agent.resume` で引き継いで学習している。報酬を変えた効果自体は観測できる(方向は正しい)が、(a) 収束済みの方策は探索(行動のばらつき)が少なく今の遅い歩き方の近くしか試せない、(b) PPO の trust region(`clip_param=0.2`, KL 目標 0.01)が 1 回の更新で方策を大きく変えないようにしている、(c) 報酬を変えた直後は価値関数(critic)が古い基準のままで学習信号が一時的に不正確になる、という理由で、大きな行動の変化(ケイデンスを倍近く上げる)には数千イテレーションでは足りない可能性が高い。この仮説を検証するため、以下 2 つの追加実験を行った。
+
+**追加実験 1: SE1+SE3 の設定でゼロから学習し直す**(上記仮説「収束済み方策の探索不足が原因」の検証)。4096 環境・10000 イテレーションを新規に実行(2 時間 56 分)。結果は仮説を裏付けなかった: 接地頻度は `flat` 0.85 / `easy_stairs` 0.87 / `moderate_stairs` 0.89 / `challenging_stairs` 0.86 Hz と、**調整前のベースラインとほぼ同じ**(継続学習で得られた SE1+SE3 の 1.02〜1.03 Hz には届かない)。カリキュラム到達レベルも `moderate_stairs` 1.63・全体平均 2.72 と、同程度の累計イテレーション数(SE1 適用直後の 14500 iter 時点)の継続学習よりも浅かった。イテレーション数が少ない(新規 10000 vs 継続の累計 17500)ことが主因の可能性が高いが、少なくとも「ゼロからやり直せば大きく改善する」という単純な予想は成立しなかった。
+
+**追加実験 2: SE4(速度コマンドの分布の偏りを緩和)**。診断(§5.5)で判明した「前進コマンドの実質 80% が 0.3 に張り付く」問題への対処として、`rel_forward_envs` を 0.6 → 0.45 に下げた(`ranges.heading` を狭める案は、heading の目標がワールド座標系の絶対方位でありスポーン時の yaw がランダムなため、直進ではなく大きな旋回を増やしてしまうと判断し採用しなかった)。SE1+SE3 のチェックポイント(17500 iter)から再開し、3000 イテレーション追加(約 53 分)。
+
+| 段階 | flat | easy_stairs | moderate_stairs | challenging_stairs | カリキュラム全体平均 |
+|---|---|---|---|---|---|
+| SE1+SE3(17500 iter) | 1.03 Hz | 1.03 Hz | 1.02 Hz | 1.02 Hz | 3.38 |
+| SE1+SE3+SE4(20500 iter) | 0.84 Hz | 0.86 Hz | 0.86 Hz | 0.85 Hz | **1.85** |
+
+**効果はなかった**。接地頻度はケイデンス改善どころか、SE1 適用前のベースライン相当(約 0.85 Hz)まで後退した。さらに、カリキュラム到達レベルが全地形で大きく後退した(全体平均 3.38 → 1.85、`moderate_stairs` 3.01 → 1.23)。転倒率自体は改善した(`fell_over` 0.167 → 0.044)が、これは「歩けていない(=昇格に必要な距離を歩ききれず、易しい地形に留まっている)」ことの裏返しと考えられる。原因は、`terrain_levels_vel` カリキュラムの昇格条件(エピソード中に地形サイズの半分 = 4 m 以上歩く)にある: `rel_forward_envs` を下げたことで指令速度の分布に低速・後退寄りのサンプルが増え(実測速度も 0.34 → 0.27 に低下)、多くの環境で昇格条件を満たしにくくなったと考えられる。コマンド分布の偏りという診断上の問題には対処できたが、副作用として登坂の進捗そのものを妨げてしまったため、**この変更は不採用とし `rel_forward_envs=0.6` に戻した**(`asimov_stairs_env_cfg.py` にコメントとして経緯を残している)。
+
+累計投入時間は計 6 回の学習で約 11 時間(1500+10000+3000+3000+10000+3000 = 30500 イテレーション)。
+
+### 5.7 現状のまとめと保留にした選択肢
+
+現時点の最良チェックポイントは、上記のとおり `logs/rsl_rl/asimov1_stairs/2026-09-22_22-13-54_stairs_se3_pose/model_17496.pt`(通算 17500 イテレーション、SE1+SE3 適用済み)のまま。ゼロからの再学習・SE4 とも、この最良チェックポイントを上回る結果は得られなかった。階段登坂の能力(カリキュラム進捗、転倒率)は SE1+SE3 まででは一貫して改善しているが、歩容の滑らかさは平地専用タスクに比べてまだ見劣りする。歩容改善は今回いったん区切り、以下は将来この続きに戻る場合の選択肢として保留した。
+
+1. 長めの継続学習(10000〜20000 イテレーション追加)。ゼロからの再学習が振るわなかった一因がイテレーション数不足である可能性は残っているため、継続学習の延長は依然として有力な候補。
+2. 一時的にエントロピー係数を上げて探索を増やす(未検証)。
+
+### 5.8 階段タスク固有のコマンド
+
+```bash
+# 学習(4096 環境、新規)
+uv run asimov-train Asimov-Velocity-Stairs --env.scene.num-envs 4096 --agent.run-name <実験名>
+
+# 学習の続きから再開
+uv run asimov-train Asimov-Velocity-Stairs --env.scene.num-envs 4096 --agent.max-iterations <追加分> \
+  --agent.resume True --agent.load-run "<日時>_<前回の実験名>" --agent.run-name <今回の実験名>
+
+# 固定指令での数値評価(地形タイプを区別しない全体平均)
+uv run python training/scripts/eval_policy.py --task Asimov-Velocity-Stairs --checkpoint <path>
+
+# 地形タイプ別の歩容診断(接地頻度・ストライド長・実測速度を flat/easy/moderate/challenging 別に集計)
+uv run python training/scripts/diagnose_gait.py --checkpoint <path>
+
+# キーボードで操作(vy の可動域が ±0.1 と狭いため --step を小さくする)
+uv run asimov-play-keyboard --task-id Asimov-Velocity-Stairs --step 0.02 --checkpoint <path>
+```
+
+`eval_policy.py` のシナリオは平地タスクと階段タスクで内容が異なる(階段用は `stand` / `climb 0.2` / `climb 0.4` / `back off -0.1` / `turn 0.3` の 5 種類、学習時のコマンド範囲に合わせて低速中心)。

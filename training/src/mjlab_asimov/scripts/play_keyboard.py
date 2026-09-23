@@ -12,7 +12,16 @@ Keys are read from the terminal because the MuJoCo viewer window binds all 26 le
 nothing in the viewer changes. Each key press (or auto-repeat) changes the command by
 ``--step``. The command is clamped to the range the policy was trained on.
 
+Works with any registered task via ``--task-id`` (default: the flat velocity task):
+
   uv run asimov-play-keyboard --checkpoint logs/rsl_rl/asimov1_velocity/<run>/model_1499.pt
+  uv run asimov-play-keyboard --task-id Asimov-Velocity-Stairs --step 0.02 \\
+      --checkpoint logs/rsl_rl/asimov1_stairs/<run>/model_29999.pt
+
+The stairs task's command ranges are much narrower than the flat task's (e.g. vy is
+only +-0.1 m/s, vs. +-0.6 on flat) -- the default ``--step`` of 0.1 will jump straight to
+a strafe axis's limit in a single keypress there, so pass a smaller ``--step`` (e.g.
+0.02) for finer control on narrow-range tasks.
 """
 
 import argparse

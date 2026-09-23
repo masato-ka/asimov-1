@@ -3,7 +3,7 @@
 A record of building a bipedal walking (velocity-tracking) policy training pipeline for Asimov-1 with mjlab. Work dates: 2026-09-21 to 22.
 
 - Target: `sim-model/xmls/asimov_1.xml` (MuJoCo MJCF)
-- Task ID: `Asimov-Velocity-Flat` (velocity-command tracking on flat ground)
+- Task ID: `Asimov-Velocity-Flat` (velocity-command tracking on flat ground), `Asimov-Velocity-Stairs` (stair climbing, §5)
 - Implementation: `training/` (the same directory as this document)
 
 ![Asimov-1 walking in simulation](assets/asimov-1-walking-high.gif)
@@ -14,6 +14,7 @@ A record of building a bipedal walking (velocity-tracking) policy training pipel
 2. [Walking Policy Training: Approach and Experimental Results](#2-walking-policy-training-approach-and-experimental-results)
 3. [Using the Scripts](#3-using-the-scripts)
 4. [Known Limitations and Future Work](#4-known-limitations-and-future-work)
+5. [Stair-Climbing Task (Asimov-Velocity-Stairs)](#5-stair-climbing-task-asimov-velocity-stairs)
 
 ---
 
@@ -277,6 +278,8 @@ uv run wandb login
 
 Training logs are sent to wandb by default, so complete `wandb login` before starting training. If you do not use wandb, specify `--agent.logger tensorboard` when training and `wandb login` is not needed (§3.5).
 
+This section covers usage common to both tasks (using the flat task `Asimov-Velocity-Flat` as the example). Commands and scripts specific to the stairs task `Asimov-Velocity-Stairs` are collected in §5.7.
+
 ### 3.1 File layout
 
 ```
@@ -285,15 +288,19 @@ training/
 ├── TECHNICAL_REPORT_en.md                    This document (English version)
 ├── src/mjlab_asimov/
 │   ├── robot/asimov_constants.py             Robot definition (actuators, initial pose, collision)
-│   ├── tasks/__init__.py                     Task registration (Asimov-Velocity-Flat)
-│   ├── tasks/asimov_velocity_env_cfg.py      Environment config (observations, rewards, DR, commands)
-│   ├── tasks/asimov_rl_cfg.py                PPO / logger config
+│   ├── tasks/__init__.py                     Task registration (both Flat and Stairs)
+│   ├── tasks/asimov_velocity_env_cfg.py      Flat task environment config (observations, rewards, DR, commands)
+│   ├── tasks/asimov_rl_cfg.py                Flat task PPO / logger config
+│   ├── tasks/asimov_stairs_terrain.py        Stairs terrain (ascent-only, §5.1)
+│   ├── tasks/asimov_stairs_env_cfg.py        Stairs task environment config (§5.2)
+│   ├── tasks/asimov_stairs_rl_cfg.py         Stairs task PPO / logger config
 │   └── scripts/
 │       ├── train_cli.py                      Implementation of asimov-train / asimov-play
 │       └── play_keyboard.py                  Implementation of asimov-play-keyboard
 ├── scripts/
 │   ├── check_standing.py                     Check of the initial pose / model build (CPU)
-│   └── eval_policy.py                        Numerical evaluation with fixed commands
+│   ├── eval_policy.py                        Numerical evaluation with fixed commands (shared by both tasks)
+│   └── diagnose_gait.py                      Per-terrain-type gait diagnostic for the stairs task (§5.4)
 └── tests/                                    Static tests (no GPU needed, 23 tests)
 ```
 
@@ -401,3 +408,166 @@ uv run pytest training/tests -q
 - Adjusting the target height (currently 0.1 m). At forward 0.8 m/s it is 10.8 cm, above the target.
 - Confirming reproducibility with multiple seeds.
 - Adding the neck joints or modeling the RSU mechanism (extending the MJCF), and deployment (an ONNX export is written automatically during training).
+
+---
+
+## 5. Stair-Climbing Task (Asimov-Velocity-Stairs)
+
+A record of building on the flat-task training pipeline to add stairs to the environment and train a stair-climbing motion. Work date: 2026-09-22. Built first as an ascent-only task; descent is planned as a future curriculum addition.
+
+### 5.1 Terrain design
+
+mjlab 1.6.0's terrain generator has a property directly relevant to designing a climbing task.
+
+- `mjlab.terrains.primitive_terrains.BoxPyramidStairsTerrainCfg` (the standard `pyramid_stairs` preset) places each environment's spawn origin at the **platform at the top of the pyramid** (`origin_z = (num_steps+1) x step_height`), so walking outward from spawn always goes downhill. Training with a forward command there would practice descent.
+- `BoxInvertedPyramidStairsTerrainCfg` (the `pyramid_stairs_inv` preset) is the opposite: the origin sits at the **bottom of a pit** (`origin_z = -(num_steps+1) x step_height`), so walking outward goes uphill. A forward command naturally trains ascent. Both were confirmed by reading the `origin` computation in the source directly.
+- mjlab already ships a dedicated stairs terrain preset, `STAIRS_TERRAINS_CFG` (`mjlab/terrains/config.py`), but it uses **only the non-inverted `pyramid_stairs`** (descending) and does not include `pyramid_stairs_inv`. It is also not used by any bundled task (untested code). To make an ascent-only task, this was not used as-is; a new terrain config built from `pyramid_stairs_inv` was defined instead (`training/src/mjlab_asimov/tasks/asimov_stairs_terrain.py`).
+
+```python
+ASIMOV_STAIRS_TERRAINS_CFG = TerrainGeneratorCfg(
+  size=(8.0, 8.0), border_width=20.0, num_rows=10, curriculum=True,
+  sub_terrains={
+    "flat": flat(proportion=0.25),
+    "easy_stairs": pyramid_stairs_inv(proportion=0.35, step_height_range=(0.02, 0.05), step_width=0.40),
+    "moderate_stairs": pyramid_stairs_inv(proportion=0.25, step_height_range=(0.05, 0.08), step_width=0.35, platform_width=2.5, border_width=0.8),
+    "challenging_stairs": pyramid_stairs_inv(proportion=0.15, step_height_range=(0.08, 0.10), step_width=0.30, platform_width=2.0, border_width=0.5),
+  },
+  add_lights=True,
+)
+```
+
+The step-height range (0.02-0.10 m) was kept at mjlab's `STAIRS_TERRAINS_CFG` defaults. Since even flat-ground walking already had trouble achieving foot lift because of the `pose` reward (§2.6), 0.10 m was judged a realistic target, not an overly easy setting. `flat` is mixed in to give the policy time to get used to the new terrain-scan observation (§5.2) and to serve as the easiest curriculum row. Adding descent later can be done by adding sibling `pyramid_stairs` (non-inverted) columns to the same config.
+
+### 5.2 Environment configuration (`training/src/mjlab_asimov/tasks/asimov_stairs_env_cfg.py`)
+
+The flat task sets `terrain_type="plane"` and strips everything related to terrain scanning; the stairs task keeps mjlab's template default (`terrain_type="generator"`) and restores/changes the following.
+
+| Item | Flat task | Stairs task |
+|---|---|---|
+| Terrain | Flat (`plane`) | `ASIMOV_STAIRS_TERRAINS_CFG` (generator) |
+| `max_init_terrain_level` | (n/a) | `0` (start on the easiest row) |
+| `terrain_scan` sensor | Removed | Restored (`frame.name="pelvis_link"`) |
+| `height_scan` observation | Removed | Restored (both actor and critic) |
+| `out_of_terrain_bounds` termination | Removed (a no-op on flat) | Restored |
+| `terrain_levels` curriculum | Removed | Restored (`command_vel` dropped as on the flat task) |
+| Command ranges | vx +-0.8, vy +-0.6, wz +-0.6 | **vx -0.1 to 0.4, vy +-0.1, wz +-0.3** (a deliberate, careful ascent) |
+| `rel_forward_envs` | 0.2 | 0.6 (more straight-line experience) |
+| `foot_clearance`/`foot_swing_height` `target_height` | 0.1 m | **0.12 m** (comfortable margin above the tallest 0.10 m riser) |
+| Simulation buffers | `njmax=300` (shrunk) | `ccd_iterations=500`, `contact_sensor_maxmatch=500`, `nconmax=70` (more contact-capable geoms from the terrain; carried over from mjlab's G1 rough-terrain config) |
+
+**Growth in observation size**: restoring `height_scan` (a 17x11, 187-dimensional grid, 1.6x1.0 m ahead of the pelvis at 0.1 m resolution) grows the actor's observation from the flat task's 45 dimensions to **232** (45 + 187). The critic adds further privileged terms (foot height, air time, contact, contact force) for 247. The PPO network/hyperparameters were carried over from the flat task as a starting point, treated as unvalidated for this input size.
+
+**Initial `pose` reward std**: the flat task's std (hip pitch 0.6, knee 0.7, ankle pitch 0.5) was judged insufficient for climbing, so it was loosened further as the initial setting (hip pitch 0.9, knee 1.0, ankle pitch 0.6; hip roll/yaw and ankle roll unchanged at 0.15/0.15/0.1). This value was later revisited in SE3 (§5.6).
+
+### 5.3 Verification before and after implementation
+
+Both before and after writing the code, assumptions were checked against measurements rather than taken on faith.
+
+1. **Visual terrain check**: an offscreen render confirmed the expected concentric-square pit shape, deepening with difficulty (`terrain_origins` z: `flat` = 0; `easy_stairs` ~ -0.08 to -0.20 m; `moderate_stairs` ~ -0.30 to -0.48 m; `challenging_stairs` ~ -0.72 to -0.90 m, corresponding to difficulty rows 0-9).
+2. **Spawn check on non-flat terrain**: mjlab's reset (`reset_root_state_uniform`) implements `default_root_state[:, 0:3] += env.scene.env_origins[env_ids]`, simply adding each terrain patch's origin (e.g. the bottom of a pit) to the home pose's position (`pos=(0,0,0.62)`). Building the actual environment confirmed that, under the training config, every environment spawns on the easiest row (level=0), and the pelvis height above the local terrain origin is consistently ~0.62-0.66 (matching the home pose) as expected.
+3. **Short smoke-training run** (1024 environments, 300 iterations): completed with no errors, NaNs, or buffer-overflow warnings. Fall rate was still high and the curriculum hadn't progressed, both expected at 300 iterations.
+
+### 5.4 Course of training
+
+**Task registration**: `Asimov-Velocity-Stairs` was registered alongside the flat task (`tasks/__init__.py`). The PPO config was forked rather than reused (`asimov_stairs_rl_cfg.py`, `experiment_name="asimov1_stairs"`, `wandb_tags=("asimov1","velocity","stairs")`).
+
+| Run | Contents | Duration | Cumulative iterations |
+|---|---|---|---|
+| First production run | 4096 envs, 1500 iterations (fresh) | 26 min 52 s | 1500 |
+| Second production run | Same, +10000 iterations (`--agent.resume`) | 2 h 57 min | 11500 |
+
+**Curriculum level reached** (`terrain_levels`, out of 10)
+
+| Terrain | 1500 iterations | 11500 iterations |
+|---|---|---|
+| flat | 2.39 | 4.71 |
+| easy_stairs | 0.53 | 3.76 |
+| moderate_stairs | 0.01 | 1.96 |
+| challenging_stairs | 0.00 | 0.09 |
+| Overall mean | 0.79 | 3.00 |
+
+**`eval_policy.py --task Asimov-Velocity-Stairs` results** (task-wide average, not split by terrain type; 0/64 falls in every case)
+
+| Command | Command (vx,vy,wz) | Achieved (1500 iter) | Achieved (11500 iter) |
+|---|---|---|---|
+| Stand | 0, 0, 0 | 0.00 | 0.00 |
+| Climb 0.2 | 0.2, 0, 0 | 0.05 (0.17 Hz) | 0.09 (0.31 Hz) |
+| Climb 0.4 | 0.4, 0, 0 | 0.29 (swing 8.0 cm) | 0.35 (swing 10.0 cm) |
+| Backward -0.1 | -0.1, 0, 0 | 0.00 | 0.00 |
+| Turn (forward 0.2 + turn 0.3) | 0.2, 0, 0.3 | 0.12 / 0.22 | 0.11 / 0.23 |
+
+By 11500 iterations, with 0 falls throughout, tracking at command 0.4 improved from 72% to 87% and swing height from 8.0 to 10.0 cm. The curriculum also reached `moderate_stairs`. Small or negative commands (0.2, -0.1) drew almost no response -- the cause was identified later, in the command-distribution analysis of §5.6.
+
+### 5.5 Diagnosing the awkward gait
+
+Visual inspection with `asimov-play-keyboard` showed "even with the forward command maxed out, it walks slowly, one step at a time" -- clearly different from the dedicated flat task's gait (1.7-1.8 Hz at a comparable speed). This was investigated in detail.
+
+1. **The gait is uniform across every terrain type**: measured at a fixed vx=0.4 command, achieved velocity (~0.34), touchdown frequency (~0.94 Hz), and stride length (~0.36 m) were nearly identical on `flat`, `easy_stairs`, `moderate_stairs`, and `challenging_stairs`. The policy had learned one universal, slow, careful gait and applied it everywhere, regardless of terrain difficulty.
+2. **Joint range of motion**: on `flat`-type cells, hip-pitch swing was ~0.50-0.57 rad (about 2x the dedicated flat policy's ~0.28 rad), and knee swing ~0.87-1.0 rad. Torque utilization was also high in places -- right ankle pitch reached 81.4% of its rated limit (p95), hip roll 56-61% (the dedicated flat policy had "headroom everywhere"). Bigger movements were being made, and held for longer.
+3. **Reward breakdown** (`flat`-type cells only, measured at command 0.4): `track_linear_velocity` (+1.89), `track_angular_velocity` (+1.96), `upright` (+0.995), and `pose` (+0.946) were all near their maximum, essentially independent of gait style. `air_time`, meanwhile, was **exactly 0**, and `foot_clearance` (-0.08) / `foot_swing_height` (-0.005) were two orders of magnitude smaller than the others. **There was effectively no live reward signal directly pushing the speed/cadence of the gait.**
+4. **Why the `air_time` reward was dead**: the `feet_air_time` reward only pays out when a foot's swing duration falls in `threshold_min=0.05` to `threshold_max=0.5` seconds (mjlab's default, left unchanged). Back-calculating from the current gait's ~0.94 Hz touchdown rate gives a swing duration of roughly 0.5-0.6 s -- **right past the 0.5 s upper cutoff**. Once past the threshold the reward is exactly 0, and because it's a threshold indicator there is no gradient pulling it back ("getting closer" isn't rewarded). The dedicated flat task used the same threshold unchanged, but its swing duration naturally stayed around 0.3 s (~1.7 Hz cadence), safely inside the window, so the mechanism worked there.
+5. **`height_scan` observation checked healthy**: no NaNs or saturation, and the distribution did vary with terrain difficulty (the policy simply hasn't learned to use that information to switch gait style yet).
+6. **Skew in the velocity-command distribution**: `UniformVelocityCommandCfg`'s forward-flag logic applies a hardcoded `vel_command_b[fwd_ids,0].abs().clamp(min=0.3)` inside mjlab. Given `lin_vel_x=(-0.1,0.4)`, about 80% of forward-flagged environments end up pinned at **exactly 0.3**, with only ~2% ever reaching 0.39 or above. The mean commanded vx across the entire training population was only 0.234.
+
+### 5.6 Reward-design revision experiments
+
+Based on the diagnosis, the same "change one thing at a time" method used for the flat task's E1-E4 was applied. Each experiment resumed from the previous experiment's checkpoint with `--agent.resume` and trained 3000 more iterations (~53 min). A dedicated per-terrain-type diagnostic script was added for evaluation (`training/scripts/diagnose_gait.py`), since the existing `eval_policy.py` averages across terrain types and would hide an improvement on flat ground being offset by a regression on hard stairs.
+
+| Experiment | Change |
+|---|---|
+| SE1 | `air_time`'s `threshold_max` from 0.5 to 0.35 s, weight from 0.5 to 0.8 |
+| SE3 | `pose` std: hip pitch 0.9->0.75, knee 1.0->0.85, ankle pitch 0.6->0.55 (roll/yaw/ankle roll unchanged) |
+
+**Per-terrain-type touchdown frequency [Hz]** (fixed vx=0.4 command, 800 envs x 8 s)
+
+| Stage | flat | easy_stairs | moderate_stairs | challenging_stairs |
+|---|---|---|---|---|
+| Baseline (11500 iter) | 0.87 | 0.87 | 0.86 | 0.87 |
+| After SE1 (14500 iter) | 0.98 | 0.98 | 0.98 | 0.98 |
+| After SE1+SE3 (17500 iter) | 1.03 | 1.03 | 1.02 | 1.02 |
+
+Both changes moved cadence in the intended direction, but with diminishing returns per experiment (+0.11, then +0.04) -- still far from the dedicated flat task's 1.7-1.8 Hz. Neither change hurt curriculum progress or fall rate (`moderate_stairs` level 1.96 -> 2.82 -> 3.01; `challenging_stairs` 0.09 -> 0.30 -> 0.23; `fell_over` 0.43 -> 0.13 -> 0.17).
+
+**Why the gains are small**: both SE1 and SE3 continued training an already-converged policy (`Mean action std` down to ~0.59-0.60) via `--agent.resume`. The reward change's effect is observable (the direction is correct), but (a) a converged policy explores little and mostly tries variations near its current slow gait, (b) PPO's trust region (`clip_param=0.2`, KL target 0.01) limits how much a single update can change the policy, and (c) right after a reward change the critic's value estimates are briefly miscalibrated for the new objective. Together these likely mean a large behavioral shift (roughly doubling cadence) needs more than a few thousand iterations. Two further experiments tested this hypothesis directly.
+
+**Follow-up experiment 1: retrain SE1+SE3 from scratch** (testing the "converged policy lacks exploration" hypothesis above). A fresh run of 4096 envs x 10000 iterations (2 h 56 min). The result did not support the hypothesis: touchdown frequency came out at `flat` 0.85 / `easy_stairs` 0.87 / `moderate_stairs` 0.89 / `challenging_stairs` 0.86 Hz -- **essentially the pre-tuning baseline**, well short of the 1.02-1.03 Hz reached by resuming with SE1+SE3. Curriculum progress was also shallower (`moderate_stairs` 1.63, overall mean 2.72) than the resumed chain at a comparable cumulative iteration count (14500, right after SE1). Fewer total iterations (10000 fresh vs. 17500 cumulative) is the most likely explanation, but at minimum the simple expectation that "starting from scratch would substantially improve things" did not hold.
+
+**Follow-up experiment 2: SE4 (reduce skew in the velocity-command distribution)**. To address the diagnosis (§5.5) that ~80% of forward-flagged environments were pinned at exactly vx=0.3, `rel_forward_envs` was lowered from 0.6 to 0.45 (narrowing `ranges.heading` was considered and rejected: the heading target is an absolute world-frame heading and spawn yaw is randomized, so a narrow range would mostly force large turns rather than straight walking). Resumed from the SE1+SE3 checkpoint (17500 iter) for 3000 more iterations (~53 min).
+
+| Stage | flat | easy_stairs | moderate_stairs | challenging_stairs | Curriculum overall mean |
+|---|---|---|---|---|---|
+| SE1+SE3 (17500 iter) | 1.03 Hz | 1.03 Hz | 1.02 Hz | 1.02 Hz | 3.38 |
+| SE1+SE3+SE4 (20500 iter) | 0.84 Hz | 0.86 Hz | 0.86 Hz | 0.85 Hz | **1.85** |
+
+**It had no positive effect.** Touchdown frequency, rather than improving, regressed to roughly the pre-SE1 baseline (~0.85 Hz). Worse, curriculum level regressed sharply across every terrain type (overall mean 3.38 -> 1.85; `moderate_stairs` 3.01 -> 1.23). The fall rate did improve (`fell_over` 0.167 -> 0.044), but this is likely better explained by "not actually walking far" (staying on easy terrain rather than covering enough distance to be promoted) than by genuine improvement. The likely cause is `terrain_levels_vel`'s promotion criterion (walking at least half the terrain size, 4 m, within an episode): lowering `rel_forward_envs` shifted more of the command distribution toward low/negative speeds (achieved velocity also dropped, 0.34 -> 0.27), making that 4 m threshold harder to reach for more environments. SE4 fixed the diagnosed command-distribution skew but at the cost of climbing progress itself, so **it was reverted** (`rel_forward_envs` set back to 0.6, with the reasoning kept as a comment in `asimov_stairs_env_cfg.py`).
+
+Total time spent across all six runs: about 11 hours (1500+10000+3000+3000+10000+3000 = 30500 iterations).
+
+### 5.7 Current status and options left on the table
+
+The best checkpoint remains `logs/rsl_rl/asimov1_stairs/2026-09-22_22-13-54_stairs_se3_pose/model_17496.pt` (17500 cumulative iterations, with SE1+SE3 applied) -- neither retraining from scratch nor SE4 beat it. Stair-climbing capability (curriculum progress, fall rate) improved consistently through SE1+SE3, but gait smoothness still lags behind the dedicated flat task. Further gait tuning was paused here; the following were left as options for picking this back up later:
+
+1. Continue training much longer (10000-20000 more iterations). Since insufficient iteration count is a plausible explanation for why retraining from scratch underperformed, extending the resumed run remains a strong candidate.
+2. Temporarily raise the entropy coefficient to increase exploration (untried).
+
+### 5.8 Stairs-task-specific commands
+
+```bash
+# Train (4096 envs, fresh)
+uv run asimov-train Asimov-Velocity-Stairs --env.scene.num-envs 4096 --agent.run-name <experiment-name>
+
+# Resume training
+uv run asimov-train Asimov-Velocity-Stairs --env.scene.num-envs 4096 --agent.max-iterations <additional-iters> \
+  --agent.resume True --agent.load-run "<timestamp>_<previous-run-name>" --agent.run-name <new-run-name>
+
+# Numerical evaluation with fixed commands (task-wide average, not split by terrain type)
+uv run python training/scripts/eval_policy.py --task Asimov-Velocity-Stairs --checkpoint <path>
+
+# Per-terrain-type gait diagnostic (touchdown frequency, stride length, achieved velocity, split by flat/easy/moderate/challenging)
+uv run python training/scripts/diagnose_gait.py --checkpoint <path>
+
+# Keyboard control (vy's range is only +-0.1, so use a smaller --step)
+uv run asimov-play-keyboard --task-id Asimov-Velocity-Stairs --step 0.02 --checkpoint <path>
+```
+
+`eval_policy.py`'s scenarios differ between the two tasks (the stairs set is `stand` / `climb 0.2` / `climb 0.4` / `back off -0.1` / `turn 0.3`, five low-speed scenarios matching the training command ranges).
